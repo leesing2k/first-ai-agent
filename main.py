@@ -6,6 +6,7 @@ vector_store = []
 
 MAX_HISTORY = 10          # keep last N messages
 SUMMARY_THRESHOLD = 20    # when to summarize
+max_reflection_loops = 3
 
 client = OpenAI()
 
@@ -51,16 +52,14 @@ def create_plan(goal):
                 "content": """
 You are a planner.
 
-Given a goal:
-- Break it into clear, ordered steps
-- Be concise
-- Do NOT solve the problem
-- Only output the plan
+Rules:
+- If the task is simple (can be solved in 1–2 steps), DO NOT create a long plan
+- Keep plans minimal and practical
+- Do NOT overthink
 
 Format:
 1. ...
 2. ...
-3. ...
 """
             },
             {
@@ -81,10 +80,12 @@ def reflect(goal, answer):
                 "content": """
 You are a strict evaluator.
 
-Your job:
-- Check if the answer fully completes the goal
-- Check correctness
-- Check if anything is missing
+Rules:
+- ONLY use facts explicitly present in:
+    a. the conversation
+    b. retrieved memory (if provided)
+- Do NOT claim missing evidence if it exists
+- If the answer matches known facts, mark COMPLETE
 
 Reply ONLY in this format:
 
@@ -106,6 +107,11 @@ ANSWER:
     )
 
     return reflection.output_text
+
+def print_vector_store():
+    print("\n===== VECTOR STORE =====")
+    for i, item in enumerate(vector_store):
+        print(f"{i}: {item['text'][:80]}...")
 
 def get_embedding(text):
     response = client.embeddings.create(
@@ -162,24 +168,57 @@ def summarize_conversation(conversation):
     return summary_response.output_text
 
 def optimize_memory(conversation, last_summary):
-    system_msg = conversation[0]
-
-    # If too long and no summary yet → create one
+    # Trigger summary
     if len(conversation) > SUMMARY_THRESHOLD and last_summary is None:
         last_summary = summarize_conversation(conversation)
 
-    # Build memory
-    optimized = [system_msg]
+    system_msgs = [m for m in conversation if m["role"] == "system"]
+    others = [m for m in conversation if m["role"] != "system"]
 
-    if last_summary:
-        optimized.append({
-            "role": "assistant",
-            "content": f"Summary of previous conversation: {last_summary}"
-        })
+    # ✅ DEFINE optimized FIRST
+    optimized = system_msgs[:1]
 
-    optimized += conversation[-MAX_HISTORY:]
+    # ✅ Always keep GOAL and PLAN
+    important = []
+    for msg in others:
+        if "GOAL:" in msg.get("content", "") or "Plan:" in msg.get("content", ""):
+            important.append(msg)
+
+    # Recent messages
+    recent = others[-MAX_HISTORY:]
+
+    # Merge (avoid duplicates)
+    seen = set()
+    merged = []
+
+    for msg in important + recent:
+        key = msg.get("content", "")
+        if key not in seen:
+            merged.append(msg)
+            seen.add(key)
+
+    optimized += merged
 
     return optimized, last_summary
+
+def clean_conversation(conv):
+    cleaned = []
+    for msg in conv:
+        role = msg.get("role")
+
+        # ✅ Keep normal messages
+        if role in ["system", "user", "assistant"] and "content" in msg:
+            cleaned.append(msg)
+
+        # ✅ Keep tool messages
+        elif role == "tool":
+            cleaned.append(msg)
+
+        # ❌ Drop assistant tool_calls WITHOUT content
+        elif role == "assistant" and "tool_calls" in msg:
+            continue
+
+    return cleaned
 
 # -------- Conversation --------
 conversation = [
@@ -198,6 +237,12 @@ Rules:
 - Follow the plan unless correction is needed
 - Do not skip steps
 - Only say DONE when everything is complete
+After a tool result is obtained:
+- Do NOT repeat the same tool call
+- Continue to the next step
+- Do NOT redo completed steps
+You already have a plan. Do NOT recreate the plan unless necessary.
+If all steps in the plan are completed, output the final answer and say DONE.
 """
 }
 ]
@@ -212,26 +257,28 @@ while True:
 
     conversation.append({"role": "user", "content": f"GOAL: {goal}"})
 
+    conversation = [
+        msg for msg in conversation
+        if not (msg.get("role") == "system" and "Execution plan:" in msg.get("content", ""))
+    ]
     plan = create_plan(goal)
     print("\n===== PLAN =====")
     print(plan)
 
-    vector_store.append({
-        "text": f"Plan: {plan}",
-        "embedding": get_embedding(plan)
+    conversation.append({
+        "role": "assistant",
+        "content": f"Plan:\n{plan}"
     })
 
-    conversation.append({
-        "role": "system",
-        "content": f"Execution plan:\n{plan}"
-    })
+    tool_calls_count = 0
 
     for step in range(10):  # more steps for autonomy
+        current_step = step + 1
         print(f"---- STEP {step+1} ----")
-        conversation.append({
-            "role": "system",
-            "content": f"Current step: {step+1}"
-        })
+        conversation = [
+            msg for msg in conversation
+            if not (msg.get("role") == "system" and "Current step:" in msg.get("content", ""))
+        ]
         optimized_conversation, last_summary = optimize_memory(
             conversation,
             last_summary
@@ -245,20 +292,24 @@ while True:
         for m in relevant_memory:
             print("-", m)
         rag_context = "\n".join(relevant_memory)
-        enhanced_input = [
-            optimized_conversation[0],  # system
-            {
-                "role": "system",
-                "content": f"Relevant past information:\n{rag_context}"
-            }
-        ] + optimized_conversation[1:]
+
+        enhanced_input = [optimized_conversation[0]]
+        if rag_context:
+            enhanced_input.append({
+                "role": "assistant",
+                "content": f"Relevant memory:\n{rag_context}"
+            })
+
+        enhanced_input += optimized_conversation[1:]
         print("\n===== LLM INPUT =====")
         for msg in enhanced_input:
             print(msg)
         
+        clean_input = clean_conversation(enhanced_input)
+
         response = client.responses.create(
             model="gpt-5",
-            input=enhanced_input,
+            input=clean_input,
             tools=tools
         )
         print("\n===== RAW RESPONSE =====")
@@ -273,6 +324,10 @@ while True:
 
         # -------- If tool is called --------
         if tool_call:
+            tool_calls_count += 1
+            if tool_calls_count > 5:
+                print("⚠️ Too many tool calls, forcing stop")
+                break
             print("TOOL CALL:", tool_call.name, tool_call.arguments)
             args = json.loads(tool_call.arguments)
 
@@ -291,19 +346,10 @@ while True:
             else:
                 result = "Unknown tool"
 
-            # 1. Add the function call to conversation
+            # Tool result
             conversation.append({
-                "type": "function_call",
-                "call_id": tool_call.call_id,
-                "name": tool_call.name,
-                "arguments": tool_call.arguments
-            })
-
-            # 2. Then add the result
-            conversation.append({
-                "type": "function_call_output",
-                "call_id": tool_call.call_id,
-                "output": str(result)
+                "role": "assistant",
+                "content": f"Step {current_step} completed with result: {result}"
             })
 
             # Continue loop → let LLM decide next step
@@ -316,42 +362,64 @@ while True:
 
             conversation.append({"role": "assistant", "content": reply})
 
-            # store user goal
-            vector_store.append({
-                "text": goal,
-                "embedding": get_embedding(goal)
-            })
+            # Store only meaningful facts (simple heuristic)
+            if len(goal) < 200:
+                vector_store.append({
+                    "text": f"User: {goal}",
+                    "embedding": get_embedding(goal)
+                })
 
-            # store assistant reply
-            vector_store.append({
-                "text": reply,
-                "embedding": get_embedding(reply)
-            })
+            # Only store short + useful replies
+            if len(reply) < 300:
+                vector_store.append({
+                    "text": f"Assistant: {reply}",
+                    "embedding": get_embedding(reply)
+                })
             
+            print_vector_store()
+
             # -------- SELF REFLECTION --------
-            reflection = reflect(goal, reply)
+            reflection = reflect(
+                    goal,
+                    f"""
+                Conversation:
+                {conversation}
+
+                Answer:
+                {reply}
+                """
+                )
             print("REFLECTION:", reflection)
 
+            conversation = [
+                msg for msg in conversation
+                if not (msg.get("role") == "system" and "Reflection feedback:" in msg.get("content", ""))
+            ]
             conversation.append({
-                "role": "system",
-                "content": f"Reflection feedback:\n{reflection}"
+                "role": "assistant",
+                "content": f"Reflection:\n{reflection}"
             })
 
             if "STATUS: COMPLETE" in reflection:
                 print("✅ Goal completed")
                 break
             else:
+                if reflection_loops > max_reflection_loops:
+                    print("⚠️ Reflection loop detected, stopping")
+                    break
+
+                reflection_loops += 1
+
+                conversation = [
+                    msg for msg in conversation
+                    if not (msg.get("role") == "system" and "Execution plan:" in msg.get("content", ""))
+                ]
                 plan = create_plan(goal)
                 print("\n===== PLAN =====")
                 print(plan)
 
-                vector_store.append({
-                    "text": f"Plan: {plan}",
-                    "embedding": get_embedding(plan)
-                })
-
                 conversation.append({
-                    "role": "system",
-                    "content": f"Execution plan:\n{plan}"
+                    "role": "assistant",
+                    "content": f"Plan:\n{plan}"
                 })
                 print("🔁 Continuing... improving answer")
