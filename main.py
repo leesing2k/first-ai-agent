@@ -271,7 +271,8 @@ while True:
     })
 
     tool_calls_count = 0
-
+    reflection_loops = 0
+    
     for step in range(10):  # more steps for autonomy
         current_step = step + 1
         print(f"---- STEP {step+1} ----")
