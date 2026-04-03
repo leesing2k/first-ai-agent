@@ -45,7 +45,7 @@ tools = [
 
 def create_plan(goal):
     plan_response = client.responses.create(
-        model="gpt-5",
+        model="gpt-5-mini",
         input=[
             {
                 "role": "system",
@@ -62,10 +62,7 @@ Format:
 2. ...
 """
             },
-            {
-                "role": "user",
-                "content": f"GOAL: {goal}"
-            }
+            {"role": "user", "content": goal}
         ]
     )
 
@@ -73,7 +70,7 @@ Format:
 
 def reflect(goal, answer):
     reflection = client.responses.create(
-        model="gpt-5",
+        model="gpt-5-mini",
         input=[
             {
                 "role": "system",
@@ -154,7 +151,7 @@ def summarize_conversation(conversation):
     ]
 
     summary_response = client.responses.create(
-        model="gpt-5",
+        model="gpt-5-mini",
         input=f"""
             Summarize the conversation focusing on:
             - key facts
@@ -181,7 +178,10 @@ def optimize_memory(conversation, last_summary):
     # ✅ Always keep GOAL and PLAN
     important = []
     for msg in others:
-        if "GOAL:" in msg.get("content", "") or "Plan:" in msg.get("content", ""):
+        if (
+            msg.get("tag") == "goal" 
+            or msg.get("tag") == "plan"
+        ):
             important.append(msg)
 
     # Recent messages
@@ -192,7 +192,7 @@ def optimize_memory(conversation, last_summary):
     merged = []
 
     for msg in important + recent:
-        key = msg.get("content", "")
+        key = (msg.get("content"), msg.get("tag"))
         if key not in seen:
             merged.append(msg)
             seen.add(key)
@@ -254,11 +254,15 @@ while True:
     if goal == "exit":
         break
 
-    conversation.append({"role": "user", "content": f"GOAL: {goal}"})
+    conversation.append({
+        "role": "user",
+        "content": goal,
+        "tag": "goal"
+    })
 
     conversation = [
         msg for msg in conversation
-        if not (msg.get("role") == "system" and msg.get("tag") == "plan")
+        if msg.get("tag") != "plan"
     ]
     plan = create_plan(goal)
     print("\n===== PLAN =====")
@@ -276,10 +280,6 @@ while True:
     for step in range(10):  # more steps for autonomy
         current_step = step + 1
         print(f"---- STEP {step+1} ----")
-        conversation = [
-            msg for msg in conversation
-            if not (msg.get("role") == "system" and "Current step:" in msg.get("content", ""))
-        ]
         optimized_conversation, last_summary = optimize_memory(
             conversation,
             last_summary
@@ -395,7 +395,7 @@ while True:
 
             conversation = [
                 msg for msg in conversation
-                if not (msg.get("role") == "system" and msg.get("tag") == "reflection")
+                if msg.get("tag") != "reflection"
             ]
             conversation.append({
                 "role": "assistant",
@@ -415,7 +415,7 @@ while True:
 
                 conversation = [
                     msg for msg in conversation
-                    if not (msg.get("role") == "system" and msg.get("tag") == "plan")
+                    if msg.get("tag") != "plan"
                 ]
                 plan = create_plan(goal)
                 print("\n===== PLAN =====")
