@@ -203,20 +203,19 @@ def optimize_memory(conversation, last_summary):
 
 def clean_conversation(conv):
     cleaned = []
+
     for msg in conv:
         role = msg.get("role")
 
-        # ✅ Keep normal messages
+        # Keep only allowed fields
         if role in ["system", "user", "assistant"] and "content" in msg:
-            cleaned.append(msg)
+            cleaned.append({
+                "role": role,
+                "content": msg["content"]
+            })
 
-        # ✅ Keep tool messages
         elif role == "tool":
             cleaned.append(msg)
-
-        # ❌ Drop assistant tool_calls WITHOUT content
-        elif role == "assistant" and "tool_calls" in msg:
-            continue
 
     return cleaned
 
@@ -259,7 +258,7 @@ while True:
 
     conversation = [
         msg for msg in conversation
-        if not (msg.get("role") == "system" and "Execution plan:" in msg.get("content", ""))
+        if not (msg.get("role") == "system" and msg.get("tag") == "plan")
     ]
     plan = create_plan(goal)
     print("\n===== PLAN =====")
@@ -267,7 +266,8 @@ while True:
 
     conversation.append({
         "role": "assistant",
-        "content": f"Plan:\n{plan}"
+        "content": plan,
+        "tag": "plan"
     })
 
     tool_calls_count = 0
@@ -350,7 +350,8 @@ while True:
             # Tool result
             conversation.append({
                 "role": "assistant",
-                "content": f"Step {current_step} completed with result: {result}"
+                "content": f"Step {current_step} completed with result: {result}",
+                "tag": "step_result"
             })
 
             # Continue loop → let LLM decide next step
@@ -394,11 +395,12 @@ while True:
 
             conversation = [
                 msg for msg in conversation
-                if not (msg.get("role") == "system" and "Reflection feedback:" in msg.get("content", ""))
+                if not (msg.get("role") == "system" and msg.get("tag") == "reflection")
             ]
             conversation.append({
                 "role": "assistant",
-                "content": f"Reflection:\n{reflection}"
+                "content": reflection,
+                "tag": "reflection"
             })
 
             if "STATUS: COMPLETE" in reflection:
@@ -413,7 +415,7 @@ while True:
 
                 conversation = [
                     msg for msg in conversation
-                    if not (msg.get("role") == "system" and "Execution plan:" in msg.get("content", ""))
+                    if not (msg.get("role") == "system" and msg.get("tag") == "plan")
                 ]
                 plan = create_plan(goal)
                 print("\n===== PLAN =====")
@@ -421,6 +423,7 @@ while True:
 
                 conversation.append({
                     "role": "assistant",
-                    "content": f"Plan:\n{plan}"
+                    "content": plan,
+                    "tag": "plan"
                 })
                 print("🔁 Continuing... improving answer")
