@@ -1,12 +1,14 @@
 from openai import OpenAI
 import json
 import numpy as np
+import re
 
 vector_store = []
 
 MAX_HISTORY = 10          # keep last N messages
 SUMMARY_THRESHOLD = 20    # when to summarize
 max_reflection_loops = 3
+MAX_MEMORY = 1000
 
 client = OpenAI()
 
@@ -120,17 +122,161 @@ def get_embedding(text):
 def cosine_similarity(a, b):
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-def retrieve_memory(query, top_k=3):
+def fast_importance(fact):
+    score = 5
+
+    if len(fact) > 40:
+        score += 2
+    if any(k in fact.lower() for k in ["error", "bug", "fail"]):
+        score += 2
+    if any(k in fact.lower() for k in ["user", "goal", "plan"]):
+        score += 1
+
+    return min(score, 10)
+
+def score_importance(fact):
+    response = client.responses.create(
+        model="gpt-5-mini",
+        input=f"""
+Rate importance of this memory (1-10):
+
+{fact}
+
+Return ONLY a number.
+"""
+    )
+
+    text = response.output_text.strip()
+    match = re.search(r"\d+", text)
+    if match:
+        return int(match.group())
+    return 5  # fallback
+
+def keyword_score(query, text):
+    q_words = set(query.lower().split())
+    t_words = set(text.lower().split())
+    return len(q_words & t_words) / (len(q_words) + 1e-5)
+
+def retrieve_memory(query, top_k=5):
     query_emb = get_embedding(query)
 
     scored = []
     for item in vector_store:
-        score = cosine_similarity(query_emb, item["embedding"])
+        if item.get("importance", 0) < 6:
+            continue
+        semantic = cosine_similarity(query_emb, item["embedding"])
+        keyword = keyword_score(query, item["text"])
+        recency = 1 / (1 + (len(vector_store) - item["timestamp"]))
+
+        score = (
+            0.7 * semantic +
+            0.2 * keyword +
+            0.1 * recency
+        )
+
         scored.append((score, item["text"]))
 
     scored.sort(reverse=True)
 
     return [text for _, text in scored[:top_k]]
+
+def rerank(query, candidates):
+    response = client.responses.create(
+        model="gpt-5-mini",
+        input=f"""
+Select the 3 most relevant memories for answering the query.
+
+Prioritize:
+- direct relevance
+- specificity
+- usefulness for reasoning
+
+Query:
+{query}
+
+Candidates:
+{candidates}
+
+Return ONLY the selected items, one per line.
+"""
+    )
+
+    lines = response.output_text.strip().split("\n")
+    return [l.strip("- ").strip() for l in lines if l.strip()]
+
+def rewrite_query(query):
+    response = client.responses.create(
+        model="gpt-5-mini",
+        input=f"""
+Rewrite this into an optimized retrieval query.
+
+Rules:
+- Expand vague terms
+- Add missing technical context
+- Keep concise
+
+Query:
+{query}
+"""
+    )
+    return response.output_text.strip()
+
+def extract_facts(text, role="user"):
+    subject_rule = (
+        "Start every sentence with 'The user ...'"
+        if role == "user"
+        else "Start every sentence with 'The assistant replied...'"
+    )
+    response = client.responses.create(
+        model="gpt-5-mini",
+        input=f"""
+Extract useful long-term facts from the text.
+
+Rules:
+- Convert facts into FULL natural sentences
+- {subject_rule}
+- Make facts self-contained (no labels like "Name:")
+- Keep them clear and specific
+- Max 5 facts
+- DO NOT extract procedural steps or actions
+- DO NOT include calculations or temporary results
+- ONLY extract stable, long-term facts about the user or environment
+
+Good examples:
+- The user's name is John.
+- The user was born on 23 June 1980.
+- The assistant calculated the result as 1533.
+
+Bad examples:
+- Name: John
+- Birthday: 23 June
+- John is the name
+
+Text:
+{text}
+
+Output format:
+- sentence 1
+- sentence 2
+
+If no useful facts, return NOTHING.
+"""
+    )
+
+    facts = response.output_text.strip().split("\n")
+
+    cleaned = []
+    for f in facts:
+        f = f.replace("- ", "").strip()
+
+        if not f:
+            continue
+        if len(f) < 10:
+            continue
+
+        cleaned.append(f)
+
+    return cleaned
 
 def explain(text):
     return f"Explanation: {text}"
@@ -288,7 +434,12 @@ while True:
         for msg in optimized_conversation:
             print(msg)
 
-        relevant_memory = retrieve_memory(goal)
+        better_query = rewrite_query(goal)
+        candidates = retrieve_memory(better_query, top_k=10)
+        if not candidates:
+            relevant_memory = []
+        else:
+            relevant_memory = rerank(better_query, candidates)
         print("\n===== RAG MEMORY =====")
         for m in relevant_memory:
             print("-", m)
@@ -297,8 +448,18 @@ while True:
         enhanced_input = [optimized_conversation[0]]
         if rag_context:
             enhanced_input.append({
-                "role": "assistant",
-                "content": f"Relevant memory:\n{rag_context}"
+            "role": "system",
+            "content": f"""
+            You have access to retrieved memory.
+
+            Rules:
+            - Use memory ONLY if relevant
+            - If used, ground your answer in it
+            - Do NOT hallucinate beyond it
+
+            Memory:
+            {rag_context}
+            """
             })
 
         enhanced_input += optimized_conversation[1:]
@@ -365,17 +526,31 @@ while True:
             conversation.append({"role": "assistant", "content": reply})
 
             # Store only meaningful facts (simple heuristic)
-            if len(goal) < 200:
+            facts = extract_facts(goal, role="user")
+            for fact in facts:
+                if any(fact == item["text"] for item in vector_store):
+                    continue
                 vector_store.append({
-                    "text": f"User: {goal}",
-                    "embedding": get_embedding(goal)
+                    "text": fact,
+                    "embedding": get_embedding(fact),
+                    "type": "fact",
+                    "source": "user",
+                    "timestamp": len(vector_store),
+                    "importance": fast_importance(fact)
                 })
 
             # Only store short + useful replies
-            if len(reply) < 300:
+            facts = extract_facts(reply, role="assistant")
+            for fact in facts:
+                if any(fact == item["text"] for item in vector_store):
+                    continue
                 vector_store.append({
-                    "text": f"Assistant: {reply}",
-                    "embedding": get_embedding(reply)
+                    "text": fact,
+                    "embedding": get_embedding(fact),
+                    "type": "fact",
+                    "source": "assistant",
+                    "timestamp": len(vector_store),
+                    "importance": fast_importance(fact)
                 })
             
             print_vector_store()
