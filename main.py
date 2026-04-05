@@ -70,6 +70,24 @@ Format:
 
     return plan_response.output_text
 
+def refresh_plan(conversation, goal):
+    conversation = [
+        msg for msg in conversation
+        if msg.get("tag") != "plan"
+    ]
+
+    plan = create_plan(goal)
+    print("\n===== PLAN =====")
+    print(plan)
+
+    conversation.append({
+        "role": "assistant",
+        "content": plan,
+        "tag": "plan"
+    })
+
+    return conversation
+
 def reflect(goal, answer):
     reflection = client.responses.create(
         model="gpt-5-mini",
@@ -406,19 +424,7 @@ while True:
         "tag": "goal"
     })
 
-    conversation = [
-        msg for msg in conversation
-        if msg.get("tag") != "plan"
-    ]
-    plan = create_plan(goal)
-    print("\n===== PLAN =====")
-    print(plan)
-
-    conversation.append({
-        "role": "assistant",
-        "content": plan,
-        "tag": "plan"
-    })
+    conversation = refresh_plan(conversation, goal)
 
     tool_calls_count = 0
     reflection_loops = 0
@@ -588,17 +594,5 @@ while True:
 
                 reflection_loops += 1
 
-                conversation = [
-                    msg for msg in conversation
-                    if msg.get("tag") != "plan"
-                ]
-                plan = create_plan(goal)
-                print("\n===== PLAN =====")
-                print(plan)
-
-                conversation.append({
-                    "role": "assistant",
-                    "content": plan,
-                    "tag": "plan"
-                })
+                conversation = refresh_plan(conversation, goal)
                 print("🔁 Continuing... improving answer")
