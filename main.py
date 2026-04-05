@@ -1,3 +1,4 @@
+from colorama import Fore, Style
 from openai import OpenAI
 import json
 import numpy as np
@@ -77,7 +78,7 @@ def refresh_plan(conversation, goal):
     ]
 
     plan = create_plan(goal)
-    print("\n===== PLAN =====")
+    print(Fore.BLUE + "\n===== PLAN =====" + Style.RESET_ALL)
     print(plan)
 
     conversation.append({
@@ -431,7 +432,7 @@ while True:
     
     for step in range(10):  # more steps for autonomy
         current_step = step + 1
-        print(f"---- STEP {step+1} ----")
+        print(Fore.GREEN + f"---- STEP {step+1} ----" + Style.RESET_ALL)
         optimized_conversation, last_summary = optimize_memory(
             conversation,
             last_summary
@@ -469,7 +470,7 @@ while True:
             })
 
         enhanced_input += optimized_conversation[1:]
-        print("\n===== LLM INPUT =====")
+        print(Fore.BLUE + "\n===== LLM INPUT =====" + Style.RESET_ALL)
         for msg in enhanced_input:
             print(msg)
         
@@ -494,9 +495,9 @@ while True:
         if tool_call:
             tool_calls_count += 1
             if tool_calls_count > 5:
-                print("⚠️ Too many tool calls, forcing stop")
+                print(Fore.RED + "⚠️ Too many tool calls, forcing stop" + Style.RESET_ALL)
                 break
-            print("TOOL CALL:", tool_call.name, tool_call.arguments)
+            print(Fore.MAGENTA + "TOOL CALL:", tool_call.name, tool_call.arguments + Style.RESET_ALL)
             args = json.loads(tool_call.arguments)
 
             if tool_call.name == "calculator":
@@ -527,7 +528,7 @@ while True:
         # -------- No tool call → final answer --------
         else:
             reply = response.output_text
-            print("AGENT:", reply)
+            print(Fore.GREEN + "AGENT:", reply + Style.RESET_ALL)
 
             conversation.append({"role": "assistant", "content": reply})
 
@@ -572,7 +573,7 @@ while True:
                 {reply}
                 """
                 )
-            print("REFLECTION:", reflection)
+            print(Fore.BLUE + "REFLECTION:", reflection + Style.RESET_ALL)
 
             conversation = [
                 msg for msg in conversation
@@ -585,14 +586,14 @@ while True:
             })
 
             if "STATUS: COMPLETE" in reflection:
-                print("✅ Goal completed")
+                print(Fore.GREEN + "✅ Goal completed" + Style.RESET_ALL)
                 break
             else:
                 if reflection_loops > max_reflection_loops:
-                    print("⚠️ Reflection loop detected, stopping")
+                    print(Fore.RED + "⚠️ Reflection loop detected, stopping" + Style.RESET_ALL)
                     break
 
                 reflection_loops += 1
 
                 conversation = refresh_plan(conversation, goal)
-                print("🔁 Continuing... improving answer")
+                print(Fore.YELLOW + "🔁 Continuing... improving answer" + Style.RESET_ALL)
