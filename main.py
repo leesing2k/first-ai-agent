@@ -13,6 +13,66 @@ MAX_MEMORY = 1000
 
 client = OpenAI()
 
+AGENTS = {
+    "planner": {
+        "model": "gpt-5-mini",
+        "system_prompt": """
+You are a planner.
+
+Rules:
+- If the task is simple (can be solved in 1-2 steps), DO NOT create a long plan
+- Keep plans minimal and practical
+- Do NOT overthink
+- Return ONLY valid JSON
+- Use this schema exactly:
+  {"steps": ["step 1", "step 2"]}
+- Keep between 1 and 5 steps
+- Each step must be short and actionable
+"""
+    },
+    "executor": {
+        "model": "gpt-5",
+        "system_prompt": """
+You are an autonomous AI agent.
+
+You will:
+1. First follow the given plan
+2. Execute step by step
+3. Use tools when needed
+4. Reflect and improve if necessary
+
+Rules:
+- Follow the plan unless correction is needed
+- Do not skip steps
+- Only say DONE when everything is complete
+After a tool result is obtained:
+- Do NOT repeat the same tool call
+- Continue to the next step
+- Do NOT redo completed steps
+You already have a plan. Do NOT recreate the plan unless necessary.
+If all steps in the plan are completed, output the final answer and say DONE.
+"""
+    },
+    "reviewer": {
+        "model": "gpt-5-mini",
+        "system_prompt": """
+You are a strict evaluator.
+
+Rules:
+- ONLY use facts explicitly present in:
+    a. the conversation
+    b. retrieved memory (if provided)
+- Do NOT claim missing evidence if it exists
+- If the answer matches known facts, mark COMPLETE
+
+Reply ONLY in this format:
+
+STATUS: COMPLETE or INCOMPLETE
+REASON: short explanation
+"""
+    }
+}
+
 # -------- Tool --------
 tools = [
     {
@@ -46,82 +106,331 @@ tools = [
     }
 ]
 
-def create_plan(goal):
-    plan_response = client.responses.create(
-        model="gpt-5-mini",
-        input=[
-            {
-                "role": "system",
-                "content": """
-You are a planner.
+def run_agent(agent_name, input_data, tools=None):
+    agent = AGENTS[agent_name]
+    request = {
+        "model": agent["model"],
+        "input": input_data
+    }
 
-Rules:
-- If the task is simple (can be solved in 1–2 steps), DO NOT create a long plan
-- Keep plans minimal and practical
-- Do NOT overthink
+    if tools is not None:
+        request["tools"] = tools
 
-Format:
-1. ...
-2. ...
-"""
-            },
-            {"role": "user", "content": goal}
-        ]
-    )
+    return client.responses.create(**request)
 
-    return plan_response.output_text
-
-def refresh_plan(conversation, goal):
-    conversation = [
-        msg for msg in conversation
+def build_planner_input(state, goal):
+    planner_history = [
+        msg for msg in state["planner_history"]
         if msg.get("tag") != "plan"
     ]
+    return clean_conversation(planner_history)
 
-    plan = create_plan(goal)
-    print(Fore.BLUE + "\n===== PLAN =====" + Style.RESET_ALL)
-    print(plan)
+def build_reviewer_input(state):
+    return clean_conversation(state["reviewer_history"])
 
-    conversation.append({
-        "role": "assistant",
-        "content": plan,
-        "tag": "plan"
-    })
+def parse_plan_response(plan_text):
+    try:
+        parsed = json.loads(plan_text)
+    except json.JSONDecodeError:
+        parsed = None
 
-    return conversation
+    if isinstance(parsed, dict):
+        steps = parsed.get("steps", [])
+        if isinstance(steps, list):
+            cleaned_steps = [
+                str(step).strip()
+                for step in steps
+                if str(step).strip()
+            ]
+            if cleaned_steps:
+                return {
+                    "tasks": [
+                        {
+                            "id": index,
+                            "description": step,
+                            "status": "pending",
+                            "result": None
+                        }
+                        for index, step in enumerate(cleaned_steps, start=1)
+                    ],
+                    "raw_text": plan_text
+                }
 
-def reflect(goal, answer):
-    reflection = client.responses.create(
-        model="gpt-5-mini",
-        input=[
+    fallback_steps = [
+        line.strip()
+        for line in plan_text.splitlines()
+        if line.strip()
+    ]
+
+    return {
+        "tasks": [
             {
-                "role": "system",
-                "content": """
-You are a strict evaluator.
+                "id": index,
+                "description": step,
+                "status": "pending",
+                "result": None
+            }
+            for index, step in enumerate(
+                fallback_steps or ["Think through the goal and respond."],
+                start=1
+            )
+        ],
+        "raw_text": plan_text
+    }
 
-Rules:
-- ONLY use facts explicitly present in:
-    a. the conversation
-    b. retrieved memory (if provided)
-- Do NOT claim missing evidence if it exists
-- If the answer matches known facts, mark COMPLETE
+def render_plan(plan_data):
+    return "\n".join(
+        f'{task["id"]}. [{task["status"].upper()}] {task["description"]}'
+        for task in plan_data["tasks"]
+    )
 
-Reply ONLY in this format:
+def build_plan_system_message(plan_data):
+    if not plan_data or not plan_data.get("tasks"):
+        return None
 
-STATUS: COMPLETE or INCOMPLETE
-REASON: short explanation
+    rendered_plan = render_plan(plan_data)
+    current_task = get_current_task(plan_data)
+    current_task_text = "No pending task."
+    if current_task is not None:
+        current_task_text = (
+            f'{current_task["id"]}. {current_task["description"]}'
+        )
+    return {
+        "role": "system",
+        "content": f"""
+You have a structured plan to follow.
+
+Current plan:
+{rendered_plan}
+
+Current task:
+{current_task_text}
 """
-            },
-            {
-                "role": "user",
-                "content": f"""
+    }
+
+def get_current_task(plan_data):
+    if not plan_data:
+        return None
+
+    for task in plan_data["tasks"]:
+        if task["status"] == "pending":
+            return task
+
+    return None
+
+def has_pending_tasks(plan_data):
+    return get_current_task(plan_data) is not None
+
+def update_current_task(plan_data, status, result_text=None, review_reason=None):
+    current_task = get_current_task(plan_data)
+    if current_task is None:
+        return
+
+    current_task["status"] = status
+    current_task["result"] = result_text
+    current_task["review_reason"] = review_reason
+
+def mark_current_task_completed(plan_data, result_text, review_reason=None):
+    update_current_task(
+        plan_data,
+        "completed",
+        result_text=result_text,
+        review_reason=review_reason
+    )
+
+def build_task_review_input(state, goal, task, result_text):
+    plan_text = "No plan available."
+    if state["current_plan"] is not None:
+        plan_text = render_plan(state["current_plan"])
+
+    return [
+        {
+            "role": "system",
+            "content": AGENTS["reviewer"]["system_prompt"]
+        },
+        {
+            "role": "system",
+            "content": f"""
+Review this single task result, not the whole goal.
+
+Allowed statuses:
+- completed
+- blocked
+- needs_replan
+
+Return ONLY valid JSON using this schema:
+{{"status":"completed|blocked|needs_replan","reason":"short explanation"}}
+
+Current plan:
+{plan_text}
+"""
+        },
+        {
+            "role": "user",
+            "content": f"""
 GOAL:
 {goal}
 
-ANSWER:
-{answer}
+TASK:
+{task["id"]}. {task["description"]}
+
+TASK RESULT:
+{result_text}
 """
+        }
+    ]
+
+def parse_task_review_response(review_text):
+    try:
+        parsed = json.loads(review_text)
+    except json.JSONDecodeError:
+        parsed = None
+
+    if isinstance(parsed, dict):
+        status = str(parsed.get("status", "")).strip().lower()
+        reason = str(parsed.get("reason", "")).strip()
+        if status in ["completed", "blocked", "needs_replan"]:
+            return {
+                "status": status,
+                "reason": reason or "No reason provided."
             }
-        ]
+
+    lowered = review_text.lower()
+    if "needs_replan" in lowered:
+        status = "needs_replan"
+    elif "blocked" in lowered:
+        status = "blocked"
+    else:
+        status = "completed"
+
+    return {
+        "status": status,
+        "reason": review_text.strip() or "No reason provided."
+    }
+
+def review_current_task(state, goal, result_text):
+    task = get_current_task(state["current_plan"])
+    if task is None:
+        return {
+            "status": "completed",
+            "reason": "No pending task to review."
+        }
+
+    review_response = run_agent(
+        "reviewer",
+        build_task_review_input(state, goal, task, result_text)
+    )
+    return parse_task_review_response(review_response.output_text)
+
+def finalize_goal(state, goal, reply):
+    add_executor_event(state, "assistant", reply)
+    add_shared_event(state, "assistant", reply)
+
+    # Store only meaningful facts (simple heuristic)
+    facts = extract_facts(goal, role="user")
+    for fact in facts:
+        if any(fact == item["text"] for item in vector_store):
+            continue
+        vector_store.append({
+            "text": fact,
+            "embedding": get_embedding(fact),
+            "type": "fact",
+            "source": "user",
+            "timestamp": len(vector_store),
+            "importance": fast_importance(fact)
+        })
+
+    # Only store short + useful replies
+    facts = extract_facts(reply, role="assistant")
+    for fact in facts:
+        if any(fact == item["text"] for item in vector_store):
+            continue
+        vector_store.append({
+            "text": fact,
+            "embedding": get_embedding(fact),
+            "type": "fact",
+            "source": "assistant",
+            "timestamp": len(vector_store),
+            "importance": fast_importance(fact)
+        })
+
+    print_vector_store()
+
+    reflection = reflect(
+            state,
+            goal,
+            f"""
+        Conversation:
+        {state["shared_memory"]}
+
+        Answer:
+        {reply}
+        """
+        )
+    print(Fore.BLUE + "REFLECTION:", reflection + Style.RESET_ALL)
+
+    state["shared_memory"] = [
+        msg for msg in state["shared_memory"]
+        if msg.get("tag") != "reflection"
+    ]
+    state["executor_history"] = [
+        msg for msg in state["executor_history"]
+        if msg.get("tag") != "reflection"
+    ]
+    add_executor_event(
+        state,
+        "assistant",
+        reflection,
+        tag="reflection"
+    )
+    add_shared_event(
+        state,
+        "assistant",
+        reflection,
+        tag="reflection"
+    )
+
+    return reflection
+
+def create_plan(state, goal):
+    plan_response = run_agent(
+        "planner",
+        build_planner_input(state, goal)
+    )
+
+    return parse_plan_response(plan_response.output_text)
+
+def refresh_plan(state, goal):
+    state["planner_history"] = [
+        msg for msg in state["planner_history"]
+        if msg.get("tag") != "plan"
+    ]
+    state["executor_history"] = [
+        msg for msg in state["executor_history"]
+        if msg.get("tag") != "plan"
+    ]
+    state["shared_memory"] = [
+        msg for msg in state["shared_memory"]
+        if msg.get("tag") != "plan"
+    ]
+
+    plan = create_plan(state, goal)
+    state["current_plan"] = plan
+    rendered_plan = render_plan(plan)
+    print(Fore.BLUE + "\n===== PLAN =====" + Style.RESET_ALL)
+    print(rendered_plan)
+
+    add_planner_event(state, "assistant", rendered_plan, tag="plan")
+    add_executor_event(state, "assistant", rendered_plan, tag="plan")
+    add_shared_event(state, "assistant", rendered_plan, tag="plan")
+
+    return state
+
+def reflect(state, goal, answer):
+    set_reviewer_history(state, goal, answer)
+    reflection = run_agent(
+        "reviewer",
+        build_reviewer_input(state)
     )
 
     return reflection.output_text
@@ -384,77 +693,136 @@ def clean_conversation(conv):
 
     return cleaned
 
-# -------- Conversation --------
-conversation = [
-    {
-    "role": "system",
-    "content": """
-You are an autonomous AI agent.
+def create_agent_state():
+    return {
+        "shared_memory": [],
+        "planner_history": [
+            {
+                "role": "system",
+                "content": AGENTS["planner"]["system_prompt"]
+            }
+        ],
+        "executor_history": [
+            {
+                "role": "system",
+                "content": AGENTS["executor"]["system_prompt"]
+            }
+        ],
+        "reviewer_history": [
+            {
+                "role": "system",
+                "content": AGENTS["reviewer"]["system_prompt"]
+            }
+        ],
+        "executor_last_summary": None,
+        "current_plan": None
+    }
 
-You will:
-1. First follow the given plan
-2. Execute step by step
-3. Use tools when needed
-4. Reflect and improve if necessary
+def add_shared_event(state, role, content, tag=None):
+    event = {
+        "role": role,
+        "content": content
+    }
+    if tag is not None:
+        event["tag"] = tag
+    state["shared_memory"].append(event)
 
-Rules:
-- Follow the plan unless correction is needed
-- Do not skip steps
-- Only say DONE when everything is complete
-After a tool result is obtained:
-- Do NOT repeat the same tool call
-- Continue to the next step
-- Do NOT redo completed steps
-You already have a plan. Do NOT recreate the plan unless necessary.
-If all steps in the plan are completed, output the final answer and say DONE.
+def add_planner_event(state, role, content, tag=None):
+    event = {
+        "role": role,
+        "content": content
+    }
+    if tag is not None:
+        event["tag"] = tag
+    state["planner_history"].append(event)
+
+def add_executor_event(state, role, content, tag=None):
+    event = {
+        "role": role,
+        "content": content
+    }
+    if tag is not None:
+        event["tag"] = tag
+    state["executor_history"].append(event)
+
+def set_reviewer_history(state, goal, answer):
+    plan_text = "No plan available."
+    if state["current_plan"] is not None:
+        plan_text = render_plan(state["current_plan"])
+
+    state["reviewer_history"] = [
+        {
+            "role": "system",
+            "content": AGENTS["reviewer"]["system_prompt"]
+        },
+        {
+            "role": "system",
+            "content": f"""
+Structured plan:
+{plan_text}
 """
-}
-]
+        },
+        {
+            "role": "user",
+            "content": f"""
+GOAL:
+{goal}
 
-last_summary = None
+ANSWER:
+{answer}
+"""
+        }
+    ]
 
-while True:
-    goal = input("Enter GOAL: ")
+def build_executor_input(state, goal):
+    conversation = state["executor_history"]
+    last_summary = state["executor_last_summary"]
+    current_task = get_current_task(state["current_plan"])
 
-    if goal == "exit":
-        break
+    optimized_conversation, last_summary = optimize_memory(
+        conversation,
+        last_summary
+    )
+    state["executor_last_summary"] = last_summary
 
-    conversation.append({
-        "role": "user",
-        "content": goal,
-        "tag": "goal"
-    })
+    print("\n===== OPTIMIZED MEMORY =====")
+    for msg in optimized_conversation:
+        print(msg)
 
-    conversation = refresh_plan(conversation, goal)
+    better_query = rewrite_query(goal)
+    candidates = retrieve_memory(better_query, top_k=10)
+    if not candidates:
+        relevant_memory = []
+    else:
+        relevant_memory = rerank(better_query, candidates)
 
-    tool_calls_count = 0
-    reflection_loops = 0
-    
-    for step in range(10):  # more steps for autonomy
-        current_step = step + 1
-        print(Fore.GREEN + f"---- STEP {step+1} ----" + Style.RESET_ALL)
-        optimized_conversation, last_summary = optimize_memory(
-            conversation,
-            last_summary
-        )
-        print("\n===== OPTIMIZED MEMORY =====")
-        for msg in optimized_conversation:
-            print(msg)
+    print("\n===== RAG MEMORY =====")
+    for memory_item in relevant_memory:
+        print("-", memory_item)
 
-        better_query = rewrite_query(goal)
-        candidates = retrieve_memory(better_query, top_k=10)
-        if not candidates:
-            relevant_memory = []
-        else:
-            relevant_memory = rerank(better_query, candidates)
-        print("\n===== RAG MEMORY =====")
-        for m in relevant_memory:
-            print("-", m)
-        rag_context = "\n".join(relevant_memory)
+    rag_context = "\n".join(relevant_memory)
 
-        enhanced_input = [optimized_conversation[0]]
-        if rag_context:
-            enhanced_input.append({
+    enhanced_input = [optimized_conversation[0]]
+
+    plan_message = build_plan_system_message(state["current_plan"])
+    if plan_message:
+        enhanced_input.append(plan_message)
+
+    if current_task is not None:
+        enhanced_input.append({
+            "role": "system",
+            "content": f"""
+Focus on this one task now:
+{current_task["id"]}. {current_task["description"]}
+
+Complete this task before moving on to any other task.
+If a tool is needed, use it.
+If this is the final pending task, provide the final answer after completing it.
+"""
+        })
+
+    if rag_context:
+        enhanced_input.append({
             "role": "system",
             "content": f"""
             You have access to retrieved memory.
@@ -467,18 +835,50 @@ while True:
             Memory:
             {rag_context}
             """
-            })
+        })
 
-        enhanced_input += optimized_conversation[1:]
-        print(Fore.BLUE + "\n===== LLM INPUT =====" + Style.RESET_ALL)
-        for msg in enhanced_input:
-            print(msg)
-        
-        clean_input = clean_conversation(enhanced_input)
+    enhanced_input += optimized_conversation[1:]
 
-        response = client.responses.create(
-            model="gpt-5",
-            input=clean_input,
+    print(Fore.BLUE + "\n===== LLM INPUT =====" + Style.RESET_ALL)
+    for msg in enhanced_input:
+        print(msg)
+
+    return clean_conversation(enhanced_input)
+
+# -------- Conversation --------
+state = create_agent_state()
+
+while True:
+    goal = input("Enter GOAL: ")
+
+    if goal == "exit":
+        break
+
+    add_shared_event(state, "user", goal, tag="goal")
+    add_planner_event(state, "user", goal, tag="goal")
+    add_executor_event(state, "user", goal, tag="goal")
+
+    state = refresh_plan(state, goal)
+
+    tool_calls_count = 0
+    reflection_loops = 0
+    
+    for step in range(10):  # more steps for autonomy
+        current_step = step + 1
+        print(Fore.GREEN + f"---- STEP {step+1} ----" + Style.RESET_ALL)
+        current_task = get_current_task(state["current_plan"])
+        if current_task is None:
+            break
+        print(
+            Fore.CYAN
+            + f'TASK {current_task["id"]}: {current_task["description"]}'
+            + Style.RESET_ALL
+        )
+        clean_input = build_executor_input(state, goal)
+
+        response = run_agent(
+            "executor",
+            clean_input,
             tools=tools
         )
         print("\n===== RAW RESPONSE =====")
@@ -516,74 +916,154 @@ while True:
                 result = "Unknown tool"
 
             # Tool result
-            conversation.append({
-                "role": "assistant",
-                "content": f"Step {current_step} completed with result: {result}",
-                "tag": "step_result"
-            })
+            add_executor_event(
+                state,
+                "assistant",
+                f"Step {current_step} completed with result: {result}",
+                tag="step_result"
+            )
+            add_shared_event(
+                state,
+                "assistant",
+                f"Step {current_step} completed with result: {result}",
+                tag="step_result"
+            )
+            task_result_text = f"Step {current_step} completed with result: {result}"
+            task_review = review_current_task(
+                state,
+                goal,
+                task_result_text
+            )
+            print(
+                Fore.BLUE
+                + f'TASK REVIEW: {task_review["status"].upper()} - {task_review["reason"]}'
+                + Style.RESET_ALL
+            )
 
-            # Continue loop → let LLM decide next step
-            continue
+            if task_review["status"] == "completed":
+                mark_current_task_completed(
+                    state["current_plan"],
+                    task_result_text,
+                    review_reason=task_review["reason"]
+                )
+            elif task_review["status"] == "blocked":
+                update_current_task(
+                    state["current_plan"],
+                    "blocked",
+                    result_text=task_result_text,
+                    review_reason=task_review["reason"]
+                )
+                print(Fore.RED + "Task is blocked. Stopping execution." + Style.RESET_ALL)
+                break
+            else:
+                update_current_task(
+                    state["current_plan"],
+                    "needs_replan",
+                    result_text=task_result_text,
+                    review_reason=task_review["reason"]
+                )
+                add_planner_event(
+                    state,
+                    "assistant",
+                    f'Task needs replan: {task_review["reason"]}',
+                    tag="task_review"
+                )
+                add_shared_event(
+                    state,
+                    "assistant",
+                    f'Task needs replan: {task_review["reason"]}',
+                    tag="task_review"
+                )
+                state = refresh_plan(state, goal)
+                print(Fore.YELLOW + "Task review requested replanning." + Style.RESET_ALL)
+                continue
+
+            if has_pending_tasks(state["current_plan"]):
+                print(
+                    Fore.YELLOW
+                    + "Task completed via tool. Moving to the next planned task."
+                    + Style.RESET_ALL
+                )
+                continue
+
+            reply = f"The final answer is {result}."
+            print(Fore.GREEN + "AGENT:", reply + Style.RESET_ALL)
+            reflection = finalize_goal(state, goal, reply)
+
+            if "STATUS: COMPLETE" in reflection:
+                print(Fore.GREEN + "✅ Goal completed" + Style.RESET_ALL)
+            else:
+                print(Fore.RED + "⚠️ Goal finished but review marked it incomplete." + Style.RESET_ALL)
+            break
 
         # -------- No tool call → final answer --------
         else:
             reply = response.output_text
             print(Fore.GREEN + "AGENT:", reply + Style.RESET_ALL)
+            task_review = review_current_task(
+                state,
+                goal,
+                reply
+            )
+            print(
+                Fore.BLUE
+                + f'TASK REVIEW: {task_review["status"].upper()} - {task_review["reason"]}'
+                + Style.RESET_ALL
+            )
 
-            conversation.append({"role": "assistant", "content": reply})
-
-            # Store only meaningful facts (simple heuristic)
-            facts = extract_facts(goal, role="user")
-            for fact in facts:
-                if any(fact == item["text"] for item in vector_store):
-                    continue
-                vector_store.append({
-                    "text": fact,
-                    "embedding": get_embedding(fact),
-                    "type": "fact",
-                    "source": "user",
-                    "timestamp": len(vector_store),
-                    "importance": fast_importance(fact)
-                })
-
-            # Only store short + useful replies
-            facts = extract_facts(reply, role="assistant")
-            for fact in facts:
-                if any(fact == item["text"] for item in vector_store):
-                    continue
-                vector_store.append({
-                    "text": fact,
-                    "embedding": get_embedding(fact),
-                    "type": "fact",
-                    "source": "assistant",
-                    "timestamp": len(vector_store),
-                    "importance": fast_importance(fact)
-                })
-            
-            print_vector_store()
-
-            # -------- SELF REFLECTION --------
-            reflection = reflect(
-                    goal,
-                    f"""
-                Conversation:
-                {conversation}
-
-                Answer:
-                {reply}
-                """
+            if task_review["status"] == "completed":
+                mark_current_task_completed(
+                    state["current_plan"],
+                    reply,
+                    review_reason=task_review["reason"]
                 )
-            print(Fore.BLUE + "REFLECTION:", reflection + Style.RESET_ALL)
+            elif task_review["status"] == "blocked":
+                update_current_task(
+                    state["current_plan"],
+                    "blocked",
+                    result_text=reply,
+                    review_reason=task_review["reason"]
+                )
+                add_executor_event(state, "assistant", reply)
+                add_shared_event(state, "assistant", reply)
+                print(Fore.RED + "Task is blocked. Stopping execution." + Style.RESET_ALL)
+                break
+            else:
+                update_current_task(
+                    state["current_plan"],
+                    "needs_replan",
+                    result_text=reply,
+                    review_reason=task_review["reason"]
+                )
+                add_executor_event(state, "assistant", reply)
+                add_shared_event(state, "assistant", reply)
+                add_planner_event(
+                    state,
+                    "assistant",
+                    f'Task needs replan: {task_review["reason"]}',
+                    tag="task_review"
+                )
+                add_shared_event(
+                    state,
+                    "assistant",
+                    f'Task needs replan: {task_review["reason"]}',
+                    tag="task_review"
+                )
+                state = refresh_plan(state, goal)
+                print(Fore.YELLOW + "Task review requested replanning." + Style.RESET_ALL)
+                continue
 
-            conversation = [
-                msg for msg in conversation
-                if msg.get("tag") != "reflection"
-            ]
-            conversation.append({
-                "role": "assistant",
-                "content": reflection,
-                "tag": "reflection"
-            })
+            if has_pending_tasks(state["current_plan"]):
+                add_executor_event(state, "assistant", reply)
+                add_shared_event(state, "assistant", reply)
+                print(
+                    Fore.YELLOW
+                    + "Task completed. Moving to the next planned task."
+                    + Style.RESET_ALL
+                )
+                continue
+
+            reflection = finalize_goal(state, goal, reply)
 
             if "STATUS: COMPLETE" in reflection:
                 print(Fore.GREEN + "✅ Goal completed" + Style.RESET_ALL)
@@ -595,5 +1075,5 @@ while True:
 
                 reflection_loops += 1
 
-                conversation = refresh_plan(conversation, goal)
+                state = refresh_plan(state, goal)
                 print(Fore.YELLOW + "🔁 Continuing... improving answer" + Style.RESET_ALL)
